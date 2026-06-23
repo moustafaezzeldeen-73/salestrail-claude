@@ -151,6 +151,40 @@ async function salestrailRequest(method, path, params) {
 // MCP server + tools
 // ---------------------------------------------------------------------------
 
+// Safe budget for a tool result's stringified size. The earlier truncation
+// in salestrailRequest only applies to raw string responses (e.g. CSV) — it
+// never fires for /export/calls/json, since that response is already a
+// parsed array by the time it gets here. A busy date range can return 150+
+// call objects (each with nested userTeams), producing output large enough
+// to break the tool-result transport. This guards against that directly on
+// the final stringified output, regardless of which endpoint was used.
+const MAX_OUTPUT_CHARS = 15000;
+
+function buildCappedResult(allItems, requestedCap, itemsKey, extraFields = {}) {
+  const totalMatching = allItems.length;
+  let count = Math.min(requestedCap, totalMatching);
+  let text;
+  while (true) {
+    const slice = allItems.slice(0, count);
+    const truncated = count < totalMatching;
+    const result = {
+      total_matching: totalMatching,
+      returned: slice.length,
+      truncated,
+      ...extraFields,
+      [itemsKey]: slice,
+    };
+    if (truncated) {
+      result.note = `Showing first ${slice.length} of ${totalMatching} matching. Narrow the date range for a more complete view — results are capped here to stay within response size limits.`;
+    }
+    text = JSON.stringify(result, null, 2);
+    if (text.length <= MAX_OUTPUT_CHARS || count <= 1) {
+      return text;
+    }
+    count = Math.max(1, Math.floor(count / 2));
+  }
+}
+
 function createServer() {
   const server = new McpServer({ name: "salestrail", version: "1.0.0" });
 
@@ -200,20 +234,9 @@ function createServer() {
         calls = calls.filter((c) => c.inbound === inbound_only);
       }
 
-      const cap = max_rows ?? 200;
-      const truncated = calls.length > cap;
-      const result = {
-        status_code: raw.status_code,
-        total_matching: calls.length,
-        returned: Math.min(calls.length, cap),
-        truncated,
-        calls: calls.slice(0, cap),
-      };
-      if (truncated) {
-        result.note = `Showing first ${cap} of ${calls.length} matching calls. Narrow the date range or pass max_rows for more/fewer.`;
-      }
-
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      const cap = max_rows ?? 80;
+      const text = buildCappedResult(calls, cap, "calls", { status_code: raw.status_code });
+      return { content: [{ type: "text", text }] };
     }
   );
 
@@ -321,20 +344,9 @@ function createServer() {
         return { content: [{ type: "text", text: JSON.stringify(raw, null, 2) }] };
       }
 
-      const cap = max_rows ?? 200;
-      const truncated = raw.data.length > cap;
-      const result = {
-        status_code: raw.status_code,
-        total_matching: raw.data.length,
-        returned: Math.min(raw.data.length, cap),
-        truncated,
-        entries: raw.data.slice(0, cap),
-      };
-      if (truncated) {
-        result.note = `Showing first ${cap} of ${raw.data.length} entries. Pass max_rows for more/fewer.`;
-      }
-
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      const cap = max_rows ?? 80;
+      const text = buildCappedResult(raw.data, cap, "entries", { status_code: raw.status_code });
+      return { content: [{ type: "text", text }] };
     }
   );
 
