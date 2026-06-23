@@ -97,9 +97,24 @@ async function salestrailRequest(method, path, params) {
     });
 
     const contentType = response.headers.get("content-type") || "";
-    const data = contentType.includes("application/json") ? await response.json() : await response.text();
+    let data = contentType.includes("application/json") ? await response.json() : await response.text();
+
+    // Safety cap: export endpoints (e.g. /export/calls/csv with no working
+    // date filter) can return the entire call history, which can be large
+    // enough to break the tool-result transport. Truncate and say so rather
+    // than silently failing.
+    const MAX_CHARS = 20000;
+    let truncated = false;
+    if (typeof data === "string" && data.length > MAX_CHARS) {
+      data = data.slice(0, MAX_CHARS);
+      truncated = true;
+    }
 
     const result = { status_code: response.status, path: url.pathname + "?" + url.searchParams.toString(), data };
+    if (truncated) {
+      result.truncated = true;
+      result.note = `Response body truncated to ${MAX_CHARS} characters to stay within tool-result size limits. Use date-range params or a narrower path to get a smaller result.`;
+    }
 
     if (response.status >= 400) {
       result.error =
@@ -227,6 +242,16 @@ function createServer() {
 
 const app = express();
 app.use(express.json());
+
+// Simple request logging so Render's Logs tab actually shows what's
+// happening — without this, failed or successful requests are invisible.
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    console.log(`${req.method} ${req.path} -> ${res.statusCode} (${Date.now() - start}ms)`);
+  });
+  next();
+});
 
 // No host-header allowlist is configured here: this server binds to 0.0.0.0
 // (required by Render) and the SDK only auto-enables DNS-rebinding
