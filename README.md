@@ -18,14 +18,17 @@ hostname in the `Host` header gets a clean `200 OK`, no special config needed.
 
 ## Tools exposed
 
-Same four tools as before, same status/caveats:
+All confirmed against Salestrail's real published API docs (call-export-controller / integration-log-export-controller):
 
-| Tool | Status |
+| Tool | What it does |
 |---|---|
-| `get_call_recording` | **Confirmed** — path is from Salestrail's own public docs |
-| `list_calls` | Best-guess path/params — verify against your real API docs |
-| `get_call_analytics` | Best-guess — verify against your real API docs |
-| `raw_request` | Always works — hit any path directly to discover real endpoints |
+| `list_calls` | Pulls calls in a date range — rep, numbers, duration, answered/inbound, CRM sync status, recording link. Uses `GET /export/calls/json`. |
+| `get_call_recording` | Recording for a specific call by `callId`. Uses `GET /export/calls/{callId}/recording`. |
+| `get_call_analytics` | Totals, answered rate, avg duration, most active hour — computed here from `list_calls` data, since Salestrail's docs don't expose a separate aggregate endpoint. |
+| `get_integration_log` | CRM sync log (which calls pushed to Salesforce/HubSpot/etc. successfully vs failed, with error messages). Uses `GET /export/integration/json`. |
+| `raw_request` | Escape hatch — call any Pull API path directly with auth attached, for exploring anything not wrapped above. |
+
+**One remaining assumption:** the docs don't list query parameter names explicitly. `from`/`to` (ISO-8601) were confirmed live against `/export/calls/csv` — `/export/calls/json` is assumed to take the same params since it's the same controller. If a tool call 400s, use `raw_request` to find the exact param names and let me know.
 
 ## Files
 
