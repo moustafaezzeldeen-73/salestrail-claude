@@ -31,8 +31,8 @@ Same four tools as before, same status/caveats:
 
 | File | Purpose |
 |---|---|
-| `server.js` | The MCP server |
-| `package.json` | Dependencies + start script (`npm start` → `node server.js`) |
+| `index.js` | The MCP server (named `index.js` because Render's Start Command on this service is set to `node index.js`) |
+| `package.json` | Dependencies + start script |
 | `package-lock.json` | Locked dependency versions |
 
 ## Auth — set ONE of these as env vars on Render
