@@ -43,9 +43,12 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 const PULL_BASE_URL = process.env.SALESTRAIL_PULL_BASE_URL || "https://standalone-api.salestrail.io";
 
-// BEST-GUESS paths — confirm/adjust once you have the real API reference.
-const PATH_LIST_CALLS = process.env.SALESTRAIL_PATH_LIST_CALLS || "/export/calls";
+// CONFIRMED via live testing against the real Salestrail API.
+const PATH_LIST_CALLS = process.env.SALESTRAIL_PATH_LIST_CALLS || "/export/calls/csv";
 const PATH_CALL_RECORDING = process.env.SALESTRAIL_PATH_CALL_RECORDING || "/export/calls/{call_id}/recording";
+// BEST-GUESS — not yet confirmed; analytics may need to be computed client-side
+// from list_calls data instead, since Salestrail's Pull API may not expose a
+// separate aggregate endpoint.
 const PATH_ANALYTICS = process.env.SALESTRAIL_PATH_ANALYTICS || "/export/analytics";
 
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -131,6 +134,28 @@ async function salestrailRequest(method, path, params) {
   }
 }
 
+/**
+ * Parse Salestrail's /export/calls/csv response (despite the name, it's
+ * tab-separated, not comma-separated) into an array of objects.
+ * Confirmed real header row:
+ *   UserId, UserName, UserEmail, UserPhone, CallId, Source, SourceDetail,
+ *   Date, Time, TimeZone, Duration, Answered, Inbound, Number,
+ *   FormattedNumber, IsIntegrated, PhonebookName, RecordingUri, RecType
+ */
+function parseCallsTsv(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
+  if (lines.length === 0) return [];
+  const headers = lines[0].split("\t");
+  return lines.slice(1).map((line) => {
+    const cells = line.split("\t");
+    const row = {};
+    headers.forEach((h, i) => {
+      row[h] = cells[i] ?? "";
+    });
+    return row;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // MCP server + tools
 // ---------------------------------------------------------------------------
@@ -143,24 +168,52 @@ function createServer() {
     {
       title: "List calls",
       description:
-        "Pull call log entries from Salestrail within a date range. BEST-GUESS " +
-        "endpoint — verify path/params against your real Salestrail API docs " +
-        "before relying on this. If it 404s, try raw_request first.",
+        "Pull call log entries from Salestrail within a date range (rep name, " +
+        "phone numbers, duration, answered/inbound flags, and a direct " +
+        "recording link per call where available). CONFIRMED endpoint, " +
+        "verified against live data.",
       inputSchema: {
-        start_date: z.string().describe('ISO 8601 date, e.g. "2026-06-01"'),
-        end_date: z.string().describe('ISO 8601 date, e.g. "2026-06-23"'),
+        start_date: z.string().describe('ISO 8601 datetime, e.g. "2026-06-01T00:00:00Z"'),
+        end_date: z.string().describe('ISO 8601 datetime, e.g. "2026-06-23T23:59:59Z"'),
         user_email: z.string().optional().describe("Optional filter to a single rep's calls"),
         answered_only: z.boolean().optional().describe("If true, only answered calls; if false, only missed"),
         inbound_only: z.boolean().optional().describe("If true, only inbound calls; if false, only outbound"),
+        max_rows: z.number().optional().describe("Cap on rows returned (default 200) to avoid huge responses"),
       },
     },
-    async ({ start_date, end_date, user_email, answered_only, inbound_only }) => {
-      const params = { startDate: start_date, endDate: end_date };
-      if (user_email !== undefined) params.userEmail = user_email;
-      if (answered_only !== undefined) params.answered = answered_only;
-      if (inbound_only !== undefined) params.inbound = inbound_only;
+    async ({ start_date, end_date, user_email, answered_only, inbound_only, max_rows }) => {
+      const params = { from: start_date, to: end_date };
+      const raw = await salestrailRequest("GET", PATH_LIST_CALLS, params);
 
-      const result = await salestrailRequest("GET", PATH_LIST_CALLS, params);
+      if (raw.error || typeof raw.data !== "string") {
+        return { content: [{ type: "text", text: JSON.stringify(raw, null, 2) }] };
+      }
+
+      let rows = parseCallsTsv(raw.data);
+
+      if (user_email !== undefined) {
+        rows = rows.filter((r) => r.UserEmail === user_email);
+      }
+      if (answered_only !== undefined) {
+        rows = rows.filter((r) => (r.Answered === "true") === answered_only);
+      }
+      if (inbound_only !== undefined) {
+        rows = rows.filter((r) => (r.Inbound === "true") === inbound_only);
+      }
+
+      const cap = max_rows ?? 200;
+      const truncated = rows.length > cap;
+      const result = {
+        status_code: raw.status_code,
+        total_matching: rows.length,
+        returned: Math.min(rows.length, cap),
+        truncated,
+        calls: rows.slice(0, cap),
+      };
+      if (truncated) {
+        result.note = `Showing first ${cap} of ${rows.length} matching calls. Narrow the date range or pass max_rows for more/fewer.`;
+      }
+
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
