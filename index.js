@@ -53,7 +53,11 @@ const PATH_ANALYTICS = process.env.SALESTRAIL_PATH_ANALYTICS || "/export/analyti
 const REQUEST_TIMEOUT_MS = 30_000;
 
 function buildAuthHeaders() {
-  const headers = { Accept: "application/json" };
+  // Use */* rather than application/json: Salestrail's export endpoints
+  // (e.g. /export/calls/csv) only produce CSV and reject a strict JSON
+  // Accept header with 406 Not Acceptable. The response parser below already
+  // falls back to plain text for non-JSON content types.
+  const headers = { Accept: "*/*" };
   const apiKey = process.env.SALESTRAIL_API_KEY;
   const customHeader = process.env.SALESTRAIL_API_KEY_HEADER;
   const basicUser = process.env.SALESTRAIL_BASIC_USERNAME;
