@@ -33,11 +33,9 @@
  */
 
 import express from "express";
-import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 // ---------------------------------------------------------------------------
 // Configuration — verify these against your real Salestrail API docs
@@ -258,37 +256,22 @@ app.use((req, res, next) => {
 // protection for localhost binds, so no 421 errors occur. This is fine for
 // a single-user private connector reached only over HTTPS by Claude.
 
-const transports = {};
-
+// Stateless mode: every request gets a fresh transport + server instance.
+// No session state is kept across requests, so there's nothing to go stale
+// when Render redeploys or restarts the process — each tool call is fully
+// self-contained, which matches what these tools actually need (simple,
+// independent API calls with no server-initiated notifications).
 app.post("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"];
-  let transport;
-
   try {
-    if (sessionId && transports[sessionId]) {
-      transport = transports[sessionId];
-    } else if (!sessionId && isInitializeRequest(req.body)) {
-      transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (sid) => {
-          transports[sid] = transport;
-        },
-      });
-      transport.onclose = () => {
-        if (transport.sessionId) delete transports[transport.sessionId];
-      };
-
-      const server = createServer();
-      await server.connect(transport);
-    } else {
-      res.status(400).json({
-        jsonrpc: "2.0",
-        id: null,
-        error: { code: -32000, message: "Bad Request: No valid session ID provided" },
-      });
-      return;
-    }
-
+    const server = createServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+    await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
     if (!res.headersSent) {
@@ -301,18 +284,22 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-async function handleSessionRequest(req, res) {
-  const sessionId = req.headers["mcp-session-id"];
-  if (!sessionId || !transports[sessionId]) {
-    res.status(400).send("Invalid or missing session ID");
-    return;
-  }
-  const transport = transports[sessionId];
-  await transport.handleRequest(req, res);
-}
-
-app.get("/mcp", handleSessionRequest);
-app.delete("/mcp", handleSessionRequest);
+// GET/DELETE are only meaningful for session-based (stateful) servers —
+// this server doesn't use sessions, so there's nothing to resume or close.
+app.get("/mcp", (req, res) => {
+  res.status(405).json({
+    jsonrpc: "2.0",
+    id: null,
+    error: { code: -32000, message: "Method not allowed: this server runs in stateless mode." },
+  });
+});
+app.delete("/mcp", (req, res) => {
+  res.status(405).json({
+    jsonrpc: "2.0",
+    id: null,
+    error: { code: -32000, message: "Method not allowed: this server runs in stateless mode." },
+  });
+});
 
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "salestrail-mcp", endpoint: "/mcp" });
