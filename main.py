@@ -40,6 +40,7 @@ from typing import Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # ---------------------------------------------------------------------------
 # Configuration — verify these against your real Salestrail API docs
@@ -115,7 +116,26 @@ def _request(method: str, path: str, params: Optional[dict] = None) -> dict:
 # MCP server + tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("salestrail")
+mcp = FastMCP(
+    "salestrail",
+    transport_security=TransportSecuritySettings(
+        # The MCP SDK validates the Host header to guard against DNS-rebinding
+        # attacks. Render serves this app behind a proxy using its own
+        # hostname, so that hostname must be explicitly allowed here or every
+        # real request gets rejected with 421 Misdirected Request.
+        #
+        # RENDER_EXTERNAL_HOSTNAME is set automatically by Render — no env
+        # var setup needed. localhost/127.0.0.1 stay allowed for local testing.
+        allowed_hosts=[
+            os.environ.get("RENDER_EXTERNAL_HOSTNAME", ""),
+            "localhost",
+            "localhost:8000",
+            "127.0.0.1",
+            "127.0.0.1:8000",
+        ],
+        allowed_origins=["*"],
+    ),
+)
 
 
 @mcp.tool()
