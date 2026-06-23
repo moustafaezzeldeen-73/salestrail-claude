@@ -120,20 +120,14 @@ mcp = FastMCP(
     "salestrail",
     transport_security=TransportSecuritySettings(
         # The MCP SDK validates the Host header to guard against DNS-rebinding
-        # attacks. Render serves this app behind a proxy using its own
-        # hostname, so that hostname must be explicitly allowed here or every
-        # real request gets rejected with 421 Misdirected Request.
-        #
-        # RENDER_EXTERNAL_HOSTNAME is set automatically by Render — no env
-        # var setup needed. localhost/127.0.0.1 stay allowed for local testing.
-        allowed_hosts=[
-            os.environ.get("RENDER_EXTERNAL_HOSTNAME", ""),
-            "localhost",
-            "localhost:8000",
-            "127.0.0.1",
-            "127.0.0.1:8000",
-        ],
-        allowed_origins=["*"],
+        # attacks (relevant when a public, multi-tenant server's local-network
+        # binding could be reached by an attacker's browser). This server is
+        # privately deployed on Render for a single user/connector, accessed
+        # only over HTTPS by Claude's MCP client, so that threat model doesn't
+        # apply here. Disabling it avoids fragile dependence on Render setting
+        # a specific hostname env var, which was causing 421 Misdirected
+        # Request errors on every real request.
+        enable_dns_rebinding_protection=False,
     ),
 )
 
