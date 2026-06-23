@@ -9,18 +9,33 @@
  * binding to localhost — Render requires binding to 0.0.0.0, so this
  * server never hits that issue in the first place.
  *
- * STATUS OF EACH TOOL — read before relying on a tool's output:
- *   - get_call_recording  -> CONFIRMED endpoint shape per Salestrail's own
- *                            public docs: /export/calls/{callId}/recording
- *   - list_calls           -> BEST-GUESS path/params. Salestrail's full Pull
- *                            API schema lives behind your org login at
- *                            https://standalone-dev.salestrail.io/integration/apidocs
- *                            (Dashboard -> Settings -> API Docs). Verify and
- *                            adjust SALESTRAIL_PATH_LIST_CALLS if needed.
- *   - get_call_analytics  -> BEST-GUESS, same caveat.
- *   - raw_request         -> Escape hatch: call ANY Pull API path directly
- *                            with auth already attached. Use this to confirm
- *                            real endpoints, then tighten the typed tools.
+ * API SURFACE — confirmed against Salestrail's real Swagger docs
+ * (call-export-controller / integration-log-export-controller):
+ *   GET /export/calls/json              -> CallData[]   (used by list_calls)
+ *   GET /export/calls/byCreated/json     -> CallData[]   (filter by record
+ *                                           creation time instead of call
+ *                                           start time — same shape)
+ *   GET /export/calls/csv                -> tab-separated text, same fields
+ *   GET /export/calls/{callId}/recording -> the call's recording (CONFIRMED,
+ *                                           used by get_call_recording)
+ *   GET /export/integration/json         -> IntegrationData[] (CRM sync log,
+ *                                           used by get_integration_log)
+ *
+ * CallData fields (confirmed): answered, callId, createdAt, duration,
+ * formattedNumber, inbound, integrated, number, phonebookName, recType,
+ * recUrl, source, sourceDetail, startTime, userEmail, userId, userName,
+ * userPhone, userTeams[].
+ *
+ * REMAINING ASSUMPTION: the docs don't list query parameters explicitly.
+ * `from`/`to` were confirmed live against /export/calls/csv (the error
+ * message named the param "from" as a required Instant). /export/calls/json
+ * is assumed to take the same from/to params since it's the same controller
+ * — if a tool call 400s on this, try raw_request to find the exact names.
+ *
+ * There is NO separate analytics/aggregate endpoint in the docs — anything
+ * dashboard-Overview-like (totals, averages, most active hour) is computed
+ * client-side in get_call_analytics from list_calls data, not from a
+ * dedicated Salestrail endpoint.
  *
  * AUTH:
  *   Salestrail's Pull API auth scheme isn't published publicly. Set ONE of
@@ -38,18 +53,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 // ---------------------------------------------------------------------------
-// Configuration — verify these against your real Salestrail API docs
+// Configuration — confirmed against Salestrail's real Swagger docs
 // ---------------------------------------------------------------------------
 
 const PULL_BASE_URL = process.env.SALESTRAIL_PULL_BASE_URL || "https://standalone-api.salestrail.io";
 
-// CONFIRMED via live testing against the real Salestrail API.
-const PATH_LIST_CALLS = process.env.SALESTRAIL_PATH_LIST_CALLS || "/export/calls/csv";
+const PATH_LIST_CALLS_JSON = process.env.SALESTRAIL_PATH_LIST_CALLS_JSON || "/export/calls/json";
+const PATH_LIST_CALLS_BY_CREATED_JSON =
+  process.env.SALESTRAIL_PATH_LIST_CALLS_BY_CREATED_JSON || "/export/calls/byCreated/json";
 const PATH_CALL_RECORDING = process.env.SALESTRAIL_PATH_CALL_RECORDING || "/export/calls/{call_id}/recording";
-// BEST-GUESS — not yet confirmed; analytics may need to be computed client-side
-// from list_calls data instead, since Salestrail's Pull API may not expose a
-// separate aggregate endpoint.
-const PATH_ANALYTICS = process.env.SALESTRAIL_PATH_ANALYTICS || "/export/analytics";
+const PATH_INTEGRATION_LOG = process.env.SALESTRAIL_PATH_INTEGRATION_LOG || "/export/integration/json";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -134,28 +147,6 @@ async function salestrailRequest(method, path, params) {
   }
 }
 
-/**
- * Parse Salestrail's /export/calls/csv response (despite the name, it's
- * tab-separated, not comma-separated) into an array of objects.
- * Confirmed real header row:
- *   UserId, UserName, UserEmail, UserPhone, CallId, Source, SourceDetail,
- *   Date, Time, TimeZone, Duration, Answered, Inbound, Number,
- *   FormattedNumber, IsIntegrated, PhonebookName, RecordingUri, RecType
- */
-function parseCallsTsv(text) {
-  const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
-  if (lines.length === 0) return [];
-  const headers = lines[0].split("\t");
-  return lines.slice(1).map((line) => {
-    const cells = line.split("\t");
-    const row = {};
-    headers.forEach((h, i) => {
-      row[h] = cells[i] ?? "";
-    });
-    return row;
-  });
-}
-
 // ---------------------------------------------------------------------------
 // MCP server + tools
 // ---------------------------------------------------------------------------
@@ -168,50 +159,58 @@ function createServer() {
     {
       title: "List calls",
       description:
-        "Pull call log entries from Salestrail within a date range (rep name, " +
-        "phone numbers, duration, answered/inbound flags, and a direct " +
-        "recording link per call where available). CONFIRMED endpoint, " +
-        "verified against live data.",
+        "Pull call log entries from Salestrail within a date range — rep " +
+        "name/email, phone numbers, duration, answered/inbound flags, CRM " +
+        "integration status, and a direct recording link per call where " +
+        "available. CONFIRMED endpoint per Salestrail's published API docs " +
+        "(GET /export/calls/json).",
       inputSchema: {
         start_date: z.string().describe('ISO 8601 datetime, e.g. "2026-06-01T00:00:00Z"'),
         end_date: z.string().describe('ISO 8601 datetime, e.g. "2026-06-23T23:59:59Z"'),
+        filter_by: z
+          .enum(["startTime", "createdAt"])
+          .optional()
+          .describe(
+            "Whether the date range filters by when the call happened (startTime, default) or when the " +
+              "record was created in Salestrail's system (createdAt) — only differs for delayed/retroactive syncs."
+          ),
         user_email: z.string().optional().describe("Optional filter to a single rep's calls"),
         answered_only: z.boolean().optional().describe("If true, only answered calls; if false, only missed"),
         inbound_only: z.boolean().optional().describe("If true, only inbound calls; if false, only outbound"),
         max_rows: z.number().optional().describe("Cap on rows returned (default 200) to avoid huge responses"),
       },
     },
-    async ({ start_date, end_date, user_email, answered_only, inbound_only, max_rows }) => {
+    async ({ start_date, end_date, filter_by, user_email, answered_only, inbound_only, max_rows }) => {
+      const path = filter_by === "createdAt" ? PATH_LIST_CALLS_BY_CREATED_JSON : PATH_LIST_CALLS_JSON;
       const params = { from: start_date, to: end_date };
-      const raw = await salestrailRequest("GET", PATH_LIST_CALLS, params);
+      const raw = await salestrailRequest("GET", path, params);
 
-      if (raw.error || typeof raw.data !== "string") {
+      if (raw.error || !Array.isArray(raw.data)) {
         return { content: [{ type: "text", text: JSON.stringify(raw, null, 2) }] };
       }
 
-      let rows = parseCallsTsv(raw.data);
-
+      let calls = raw.data;
       if (user_email !== undefined) {
-        rows = rows.filter((r) => r.UserEmail === user_email);
+        calls = calls.filter((c) => c.userEmail === user_email);
       }
       if (answered_only !== undefined) {
-        rows = rows.filter((r) => (r.Answered === "true") === answered_only);
+        calls = calls.filter((c) => c.answered === answered_only);
       }
       if (inbound_only !== undefined) {
-        rows = rows.filter((r) => (r.Inbound === "true") === inbound_only);
+        calls = calls.filter((c) => c.inbound === inbound_only);
       }
 
       const cap = max_rows ?? 200;
-      const truncated = rows.length > cap;
+      const truncated = calls.length > cap;
       const result = {
         status_code: raw.status_code,
-        total_matching: rows.length,
-        returned: Math.min(rows.length, cap),
+        total_matching: calls.length,
+        returned: Math.min(calls.length, cap),
         truncated,
-        calls: rows.slice(0, cap),
+        calls: calls.slice(0, cap),
       };
       if (truncated) {
-        result.note = `Showing first ${cap} of ${rows.length} matching calls. Narrow the date range or pass max_rows for more/fewer.`;
+        result.note = `Showing first ${cap} of ${calls.length} matching calls. Narrow the date range or pass max_rows for more/fewer.`;
       }
 
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -244,21 +243,97 @@ function createServer() {
     {
       title: "Get call analytics",
       description:
-        "Get aggregated call performance metrics for a date range — the same " +
-        "kind of data shown on Salestrail's dashboard Overview (calls, avg " +
-        "duration, ranking, most active hour). BEST-GUESS endpoint — verify " +
-        "against your real docs. If it 404s, try raw_request first.",
+        "Aggregated call performance metrics for a date range — totals, " +
+        "answered rate, average duration, inbound/outbound split, and most " +
+        "active hour — the same kind of data shown on Salestrail's dashboard " +
+        "Overview. NOTE: Salestrail's API docs don't expose a separate " +
+        "analytics endpoint, so this is computed here from the same data as " +
+        "list_calls rather than a dedicated Salestrail aggregate endpoint.",
       inputSchema: {
-        start_date: z.string().describe('ISO 8601 date, e.g. "2026-06-01"'),
-        end_date: z.string().describe('ISO 8601 date, e.g. "2026-06-23"'),
+        start_date: z.string().describe('ISO 8601 datetime, e.g. "2026-06-01T00:00:00Z"'),
+        end_date: z.string().describe('ISO 8601 datetime, e.g. "2026-06-23T23:59:59Z"'),
         user_email: z.string().optional().describe("Optional filter to a single rep"),
       },
     },
     async ({ start_date, end_date, user_email }) => {
-      const params = { startDate: start_date, endDate: end_date };
-      if (user_email !== undefined) params.userEmail = user_email;
+      const raw = await salestrailRequest("GET", PATH_LIST_CALLS_JSON, { from: start_date, to: end_date });
 
-      const result = await salestrailRequest("GET", PATH_ANALYTICS, params);
+      if (raw.error || !Array.isArray(raw.data)) {
+        return { content: [{ type: "text", text: JSON.stringify(raw, null, 2) }] };
+      }
+
+      const calls = user_email !== undefined ? raw.data.filter((c) => c.userEmail === user_email) : raw.data;
+
+      const answered = calls.filter((c) => c.answered);
+      const inbound = calls.filter((c) => c.inbound);
+      const outbound = calls.filter((c) => !c.inbound);
+      const totalDuration = answered.reduce((sum, c) => sum + (c.duration || 0), 0);
+
+      const hourCounts = {};
+      for (const c of calls) {
+        if (!c.startTime) continue;
+        const hour = new Date(c.startTime).getUTCHours();
+        hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+      }
+      const mostActiveHourUtc = Object.entries(hourCounts).sort((a, b) => b[1] - a[1])[0]?.[0];
+
+      const result = {
+        date_range: { from: start_date, to: end_date },
+        user_email: user_email ?? "all",
+        total_calls: calls.length,
+        answered: answered.length,
+        missed: calls.length - answered.length,
+        answered_rate: calls.length ? Math.round((answered.length / calls.length) * 1000) / 10 : 0,
+        inbound: inbound.length,
+        outbound: outbound.length,
+        avg_duration_seconds_answered: answered.length ? Math.round(totalDuration / answered.length) : 0,
+        total_talk_time_seconds: totalDuration,
+        most_active_hour_utc: mostActiveHourUtc !== undefined ? `${mostActiveHourUtc}:00` : null,
+      };
+
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "get_integration_log",
+    {
+      title: "Get CRM integration log",
+      description:
+        "Get the CRM integration sync log — which calls were successfully " +
+        "pushed to your connected CRM (Salesforce/HubSpot/etc.) vs failed, " +
+        "with error messages for failures. CONFIRMED endpoint per Salestrail's " +
+        "published API docs (GET /export/integration/json).",
+      inputSchema: {
+        start_date: z.string().optional().describe('Optional ISO 8601 datetime filter, e.g. "2026-06-01T00:00:00Z"'),
+        end_date: z.string().optional().describe('Optional ISO 8601 datetime filter, e.g. "2026-06-23T23:59:59Z"'),
+        max_rows: z.number().optional().describe("Cap on rows returned (default 200)"),
+      },
+    },
+    async ({ start_date, end_date, max_rows }) => {
+      const params = {};
+      if (start_date !== undefined) params.from = start_date;
+      if (end_date !== undefined) params.to = end_date;
+
+      const raw = await salestrailRequest("GET", PATH_INTEGRATION_LOG, params);
+
+      if (raw.error || !Array.isArray(raw.data)) {
+        return { content: [{ type: "text", text: JSON.stringify(raw, null, 2) }] };
+      }
+
+      const cap = max_rows ?? 200;
+      const truncated = raw.data.length > cap;
+      const result = {
+        status_code: raw.status_code,
+        total_matching: raw.data.length,
+        returned: Math.min(raw.data.length, cap),
+        truncated,
+        entries: raw.data.slice(0, cap),
+      };
+      if (truncated) {
+        result.note = `Showing first ${cap} of ${raw.data.length} entries. Pass max_rows for more/fewer.`;
+      }
+
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
