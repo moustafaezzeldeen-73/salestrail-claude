@@ -79,6 +79,16 @@ const PATH_LIST_CALLS_BY_CREATED_JSON =
 const PATH_CALL_RECORDING = process.env.SALESTRAIL_PATH_CALL_RECORDING || "/export/calls/{call_id}/recording";
 const PATH_INTEGRATION_LOG = process.env.SALESTRAIL_PATH_INTEGRATION_LOG || "/export/integration/json";
 
+// Gemini config — used ONLY by transcribe_recording, to call Gemini directly
+// from this server with the recording bytes it already has in hand, instead
+// of round-tripping the full base64 audio through the calling MCP client's
+// context (which is needlessly expensive — get_call_recording's output for
+// even a short call can be hundreds of KB of base64). Set GEMINI_API_KEY on
+// this same Render service to enable this tool.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta";
+const GEMINI_AUDIO_MODEL = process.env.GEMINI_AUDIO_MODEL || "gemini-2.5-flash";
+
 const REQUEST_TIMEOUT_MS = 30_000;
 
 // All timestamps from Salestrail's API are UTC. Mustafa operates out of
@@ -464,6 +474,100 @@ function createServer() {
       };
     }
 
+  );
+
+  server.registerTool(
+    "transcribe_recording",
+    {
+      title: "Transcribe a call recording (server-side, no audio through the client)",
+      description:
+        "Fetches a call's recording from Salestrail and transcribes it via Gemini ENTIRELY on this server — " +
+        "the audio bytes never pass through the calling MCP client's context, only the resulting transcript " +
+        "text does. Use this instead of get_call_recording + a separate transcription tool when you just need " +
+        "the words said on the call, not the raw audio file. Requires GEMINI_API_KEY to be set on this server.",
+      inputSchema: {
+        call_id: z.string().describe(
+          'The Salestrail call UUID with dashes, e.g. "900d8b36-231a-460f-b475-bc768fe8a64c"'
+        ),
+        instruction: z
+          .string()
+          .optional()
+          .describe('Optional instruction, e.g. "transcribe in Egyptian Arabic" or "translate to English"'),
+      },
+    },
+    async ({ call_id, instruction }) => {
+      if (!GEMINI_API_KEY) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "GEMINI_API_KEY is not set on this server. Add it as an environment variable on Render to enable server-side transcription.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const path = PATH_CALL_RECORDING.replace("{call_id}", encodeURIComponent(call_id));
+      const recording = await salestrailRequest("GET", path);
+
+      if (recording.encoding !== "base64" || recording.status_code >= 400) {
+        return {
+          content: [{ type: "text", text: JSON.stringify(recording, null, 2) }],
+          isError: true,
+        };
+      }
+
+      const mimeType =
+        recording.content_type && !recording.content_type.includes("octet-stream")
+          ? recording.content_type
+          : "audio/mp4";
+      const prompt = instruction || "Transcribe this audio file exactly, word for word. Output only the transcript.";
+
+      try {
+        const geminiResponse = await fetch(
+          `${GEMINI_BASE_URL}/models/${GEMINI_AUDIO_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [
+                {
+                  role: "user",
+                  parts: [
+                    { inlineData: { mimeType, data: recording.data } },
+                    { text: prompt },
+                  ],
+                },
+              ],
+            }),
+          }
+        );
+        const geminiData = await geminiResponse.json();
+
+        if (!geminiResponse.ok) {
+          return {
+            content: [{ type: "text", text: `Gemini API error ${geminiResponse.status}: ${JSON.stringify(geminiData)}` }],
+            isError: true,
+          };
+        }
+
+        const transcript =
+          geminiData.candidates?.[0]?.content?.parts
+            ?.map((p) => p.text)
+            .filter(Boolean)
+            .join("\n") || "";
+
+        return {
+          content: [{ type: "text", text: JSON.stringify({ call_id, transcript }, null, 2) }],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Request to Gemini failed: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
   );
 
   server.registerTool(
