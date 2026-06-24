@@ -66,6 +66,47 @@ const PATH_INTEGRATION_LOG = process.env.SALESTRAIL_PATH_INTEGRATION_LOG || "/ex
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
+// All timestamps from Salestrail's API are UTC. Mustafa operates out of
+// Egypt, which has changed its DST policy more than once — using the IANA
+// zone name (rather than a hardcoded +2/+3 offset) means this stays correct
+// automatically across any future DST changes, instead of needing a manual
+// fix every time the offset shifts.
+const TIMEZONE = process.env.SALESTRAIL_TIMEZONE || "Africa/Cairo";
+
+function toLocalTimeString(isoString) {
+  if (!isoString) return "";
+  const d = new Date(isoString);
+  if (isNaN(d.getTime())) return "";
+  // "2026-06-23 19:06:20 EEST" style — unambiguous about which zone/offset
+  // was used, since DST means the same call could be +2 or +3 depending on
+  // time of year.
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+  const tzName = new Intl.DateTimeFormat("en-US", { timeZone: TIMEZONE, timeZoneName: "short" })
+    .formatToParts(d)
+    .find((p) => p.type === "timeZoneName")?.value;
+  return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")} ${tzName}`;
+}
+
+function localHour(isoString) {
+  if (!isoString) return null;
+  const d = new Date(isoString);
+  if (isNaN(d.getTime())) return null;
+  return parseInt(
+    new Intl.DateTimeFormat("en-US", { timeZone: TIMEZONE, hour: "2-digit", hour12: false }).format(d),
+    10
+  );
+}
+
 function buildAuthHeaders() {
   // Use */* rather than application/json: Salestrail's export endpoints
   // (e.g. /export/calls/csv) only produce CSV and reject a strict JSON
@@ -158,9 +199,14 @@ async function salestrailRequest(method, path, params) {
 // call objects (each with nested userTeams), producing output large enough
 // to break the tool-result transport. This guards against that directly on
 // the final stringified output, regardless of which endpoint was used.
-const MAX_OUTPUT_CHARS = 15000;
+// Full call objects (with userTeams, recUrl, etc.) use the lower default;
+// summary_only mode strips those fields, so it's safe to allow a larger
+// budget there and still stay well clear of the size that originally broke
+// the transport (~286KB).
+const MAX_OUTPUT_CHARS_DEFAULT = 15000;
+const MAX_OUTPUT_CHARS_SUMMARY = 50000;
 
-function buildCappedResult(allItems, requestedCap, itemsKey, extraFields = {}) {
+function buildCappedResult(allItems, requestedCap, itemsKey, extraFields = {}, maxChars = MAX_OUTPUT_CHARS_DEFAULT) {
   const totalMatching = allItems.length;
   let count = Math.min(requestedCap, totalMatching);
   let text;
@@ -178,7 +224,7 @@ function buildCappedResult(allItems, requestedCap, itemsKey, extraFields = {}) {
       result.note = `Showing first ${slice.length} of ${totalMatching} matching. Narrow the date range for a more complete view — results are capped here to stay within response size limits.`;
     }
     text = JSON.stringify(result, null, 2);
-    if (text.length <= MAX_OUTPUT_CHARS || count <= 1) {
+    if (text.length <= maxChars || count <= 1) {
       return text;
     }
     count = Math.max(1, Math.floor(count / 2));
@@ -209,12 +255,39 @@ function createServer() {
               "record was created in Salestrail's system (createdAt) — only differs for delayed/retroactive syncs."
           ),
         user_email: z.string().optional().describe("Optional filter to a single rep's calls"),
+        phone_number: z
+          .string()
+          .optional()
+          .describe(
+            "Optional filter to calls involving this phone number (matches either local or +country-code format, " +
+              'e.g. "01050008847" matches a call stored as "+201050008847")'
+          ),
         answered_only: z.boolean().optional().describe("If true, only answered calls; if false, only missed"),
         inbound_only: z.boolean().optional().describe("If true, only inbound calls; if false, only outbound"),
+        summary_only: z
+          .boolean()
+          .optional()
+          .describe(
+            "If true, return only number/formattedNumber/startTime/answered/inbound/duration per call " +
+              "(drops userTeams, recUrl, source, etc.). Much smaller per-call size, so far more calls fit in " +
+              "one response before the size cap kicks in — use this for bulk cross-referencing (e.g. 'which of " +
+              "these phone numbers got called today'), and the full mode only when you need recording links or " +
+              "CRM integration status for specific calls."
+          ),
         max_rows: z.number().optional().describe("Cap on rows returned (default 200) to avoid huge responses"),
       },
     },
-    async ({ start_date, end_date, filter_by, user_email, answered_only, inbound_only, max_rows }) => {
+    async ({
+      start_date,
+      end_date,
+      filter_by,
+      user_email,
+      phone_number,
+      answered_only,
+      inbound_only,
+      summary_only,
+      max_rows,
+    }) => {
       const path = filter_by === "createdAt" ? PATH_LIST_CALLS_BY_CREATED_JSON : PATH_LIST_CALLS_JSON;
       const params = { from: start_date, to: end_date };
       const raw = await salestrailRequest("GET", path, params);
@@ -227,6 +300,18 @@ function createServer() {
       if (user_email !== undefined) {
         calls = calls.filter((c) => c.userEmail === user_email);
       }
+      if (phone_number !== undefined) {
+        // Normalize by stripping everything but digits, then compare the
+        // last 9 digits — long enough to be specific, short enough to
+        // ignore +20/0/leading-zero country-code formatting differences
+        // between what's stored (e.g. "+201050008847") and what's searched
+        // for (e.g. "01050008847").
+        const normalize = (s) => (s || "").replace(/\D/g, "").slice(-9);
+        const target = normalize(phone_number);
+        calls = calls.filter(
+          (c) => normalize(c.number) === target || normalize(c.formattedNumber) === target
+        );
+      }
       if (answered_only !== undefined) {
         calls = calls.filter((c) => c.answered === answered_only);
       }
@@ -234,8 +319,35 @@ function createServer() {
         calls = calls.filter((c) => c.inbound === inbound_only);
       }
 
+      // startTime/createdAt from Salestrail are UTC. Add a local-time
+      // field alongside the original so times match what actually shows
+      // on the phone/dashboard (e.g. 16:06 UTC -> 19:06 Cairo in summer).
+      calls = calls.map((c) => ({
+        ...c,
+        startTimeLocal: toLocalTimeString(c.startTime),
+        createdAtLocal: toLocalTimeString(c.createdAt),
+      }));
+
+      if (summary_only) {
+        calls = calls.map((c) => ({
+          number: c.number,
+          formattedNumber: c.formattedNumber,
+          startTime: c.startTime,
+          startTimeLocal: c.startTimeLocal,
+          answered: c.answered,
+          inbound: c.inbound,
+          duration: c.duration,
+        }));
+      }
+
       const cap = max_rows ?? 80;
-      const text = buildCappedResult(calls, cap, "calls", { status_code: raw.status_code });
+      const text = buildCappedResult(
+        calls,
+        cap,
+        "calls",
+        { status_code: raw.status_code, timezone: TIMEZONE },
+        summary_only ? MAX_OUTPUT_CHARS_SUMMARY : MAX_OUTPUT_CHARS_DEFAULT
+      );
       return { content: [{ type: "text", text }] };
     }
   );
@@ -295,13 +407,15 @@ function createServer() {
       const hourCounts = {};
       for (const c of calls) {
         if (!c.startTime) continue;
-        const hour = new Date(c.startTime).getUTCHours();
+        const hour = localHour(c.startTime);
+        if (hour === null) continue;
         hourCounts[hour] = (hourCounts[hour] || 0) + 1;
       }
-      const mostActiveHourUtc = Object.entries(hourCounts).sort((a, b) => b[1] - a[1])[0]?.[0];
+      const mostActiveHour = Object.entries(hourCounts).sort((a, b) => b[1] - a[1])[0]?.[0];
 
       const result = {
         date_range: { from: start_date, to: end_date },
+        timezone: TIMEZONE,
         user_email: user_email ?? "all",
         total_calls: calls.length,
         answered: answered.length,
@@ -311,7 +425,7 @@ function createServer() {
         outbound: outbound.length,
         avg_duration_seconds_answered: answered.length ? Math.round(totalDuration / answered.length) : 0,
         total_talk_time_seconds: totalDuration,
-        most_active_hour_utc: mostActiveHourUtc !== undefined ? `${mostActiveHourUtc}:00` : null,
+        most_active_hour_local: mostActiveHour !== undefined ? `${mostActiveHour}:00` : null,
       };
 
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -345,7 +459,13 @@ function createServer() {
       }
 
       const cap = max_rows ?? 80;
-      const text = buildCappedResult(raw.data, cap, "entries", { status_code: raw.status_code });
+      const entries = raw.data.map((e) => ({
+        ...e,
+        callStartTimeLocal: toLocalTimeString(e.callStartTime),
+        integrationLogCreatedLocal: toLocalTimeString(e.integrationLogCreated),
+        integrationLogUpdatedLocal: toLocalTimeString(e.integrationLogUpdated),
+      }));
+      const text = buildCappedResult(entries, cap, "entries", { status_code: raw.status_code, timezone: TIMEZONE });
       return { content: [{ type: "text", text }] };
     }
   );
