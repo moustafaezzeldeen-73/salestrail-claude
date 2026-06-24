@@ -167,20 +167,57 @@ async function salestrailRequest(method, path, params) {
     });
 
     const contentType = response.headers.get("content-type") || "";
-    let data = contentType.includes("application/json") ? await response.json() : await response.text();
+    // Binary payloads (call recordings: audio/mp4, audio/*, or a generic
+    // application/octet-stream) must NOT go through response.text(). Binary
+    // bytes are not valid UTF-8, so decoding them as text silently replaces
+    // invalid byte sequences with U+FFFD — irreversibly corrupting the file.
+    // Confirmed live against get_call_recording: the JSON-stuffed-with-text
+    // approach produced unplayable garbage instead of a usable m4a. Base64
+    // round-trips losslessly through JSON instead.
+    const isBinary = /^(audio|video|image)\//i.test(contentType) || contentType.includes("octet-stream");
+
+    let data;
+    let isBase64 = false;
+    if (isBinary) {
+      data = Buffer.from(await response.arrayBuffer()).toString("base64");
+      isBase64 = true;
+    } else {
+      data = contentType.includes("application/json") ? await response.json() : await response.text();
+    }
 
     // Safety cap: export endpoints (e.g. /export/calls/csv with no working
     // date filter) can return the entire call history, which can be large
     // enough to break the tool-result transport. Truncate and say so rather
-    // than silently failing.
+    // than silently failing. Never applies to base64 binary data — slicing
+    // a base64 string mid-stream corrupts it just as badly as the old text()
+    // bug did, so oversized binary gets a clean error instead (see below).
     const MAX_CHARS = 20000;
     let truncated = false;
-    if (typeof data === "string" && data.length > MAX_CHARS) {
+    if (typeof data === "string" && data.length > MAX_CHARS && !isBase64) {
       data = data.slice(0, MAX_CHARS);
       truncated = true;
     }
 
-    const result = { status_code: response.status, path: url.pathname + "?" + url.searchParams.toString(), data };
+    // Generous cap (~6MB raw / ~8M base64 chars) — comfortably covers typical
+    // sales-call recordings while still protecting the tool-result transport
+    // from an unexpectedly huge file.
+    const MAX_BASE64_CHARS = 8_000_000;
+    if (isBase64 && data.length > MAX_BASE64_CHARS) {
+      return {
+        status_code: response.status,
+        path: url.pathname + "?" + url.searchParams.toString(),
+        error:
+          `Recording is ~${Math.round(data.length / 1024)}KB base64-encoded, too large for a single tool ` +
+          "result. This file can't be returned through this tool — use the direct recUrl instead.",
+      };
+    }
+
+    const result = {
+      status_code: response.status,
+      path: url.pathname + "?" + url.searchParams.toString(),
+      data,
+      ...(isBase64 && { encoding: "base64", content_type: contentType }),
+    };
     if (truncated) {
       result.truncated = true;
       result.note = `Response body truncated to ${MAX_CHARS} characters to stay within tool-result size limits. Use date-range params or a narrower path to get a smaller result.`;
@@ -383,7 +420,28 @@ function createServer() {
     async ({ call_id }) => {
       const path = PATH_CALL_RECORDING.replace("{call_id}", encodeURIComponent(call_id));
       const result = await salestrailRequest("GET", path);
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+
+      if (result.encoding === "base64" && result.status_code < 400) {
+        // Salestrail's recording content-type has been observed as a generic
+        // application/octet-stream rather than a specific audio/* type, so
+        // fall back to audio/mp4 (the container for .m4a, the recType seen
+        // on calls so far) when the header doesn't give us anything useful.
+        const mimeType =
+          result.content_type && !result.content_type.includes("octet-stream")
+            ? result.content_type
+            : "audio/mp4";
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ status_code: result.status_code, call_id }) },
+            { type: "audio", data: result.data, mimeType },
+          ],
+        };
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        isError: result.status_code >= 400 || Boolean(result.error),
+      };
     }
   );
 
