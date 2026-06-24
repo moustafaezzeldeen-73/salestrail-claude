@@ -49,6 +49,21 @@
 
 import express from "express";
 import { z } from "zod";
+
+// Some MCP clients (notably when a connector's cached tool list is stale —
+// e.g. right after adding a new boolean param without the client having
+// re-fetched the schema) send boolean arguments as the strings "true"/"false"
+// instead of real JSON booleans, which a plain z.boolean() rejects outright.
+// Confirmed live: this happened for `summary_only` immediately after adding
+// it. Accepting both keeps the tool working regardless of which form the
+// client happens to send.
+const lenientBoolean = z.preprocess((val) => {
+  if (typeof val === "string") {
+    if (val.toLowerCase() === "true") return true;
+    if (val.toLowerCase() === "false") return false;
+  }
+  return val;
+}, z.boolean());
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
@@ -262,10 +277,9 @@ function createServer() {
             "Optional filter to calls involving this phone number (matches either local or +country-code format, " +
               'e.g. "01050008847" matches a call stored as "+201050008847")'
           ),
-        answered_only: z.boolean().optional().describe("If true, only answered calls; if false, only missed"),
-        inbound_only: z.boolean().optional().describe("If true, only inbound calls; if false, only outbound"),
-        summary_only: z
-          .boolean()
+        answered_only: lenientBoolean.optional().describe("If true, only answered calls; if false, only missed"),
+        inbound_only: lenientBoolean.optional().describe("If true, only inbound calls; if false, only outbound"),
+        summary_only: lenientBoolean
           .optional()
           .describe(
             "If true, return only number/formattedNumber/startTime/answered/inbound/duration per call " +
