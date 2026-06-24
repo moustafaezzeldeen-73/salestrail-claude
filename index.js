@@ -430,10 +430,30 @@ function createServer() {
           result.content_type && !result.content_type.includes("octet-stream")
             ? result.content_type
             : "audio/mp4";
+        // NOTE: this was originally an MCP "audio" content block, which is
+        // the semantically correct type — but confirmed live that at least
+        // one real MCP client (Claude's claude.ai chat client) strips audio
+        // blocks before they reach the model, replacing them with a "not
+        // currently supported" notice. A "text" block containing the same
+        // base64 payload as JSON is universally supported (text is always
+        // renderable) and just as lossless, since base64 is plain ASCII —
+        // the original corruption bug was from decoding raw, un-encoded
+        // binary as UTF-8 text, not from carrying an already-base64 string
+        // inside a text block. This also makes the payload directly
+        // chainable into another tool's base64 audio input (e.g. a
+        // transcription tool) without any client-side audio support.
         return {
           content: [
-            { type: "text", text: JSON.stringify({ status_code: result.status_code, call_id }) },
-            { type: "audio", data: result.data, mimeType },
+            {
+              type: "text",
+              text: JSON.stringify({
+                status_code: result.status_code,
+                call_id,
+                mime_type: mimeType,
+                encoding: "base64",
+                data: result.data,
+              }),
+            },
           ],
         };
       }
@@ -443,6 +463,7 @@ function createServer() {
         isError: result.status_code >= 400 || Boolean(result.error),
       };
     }
+
   );
 
   server.registerTool(
